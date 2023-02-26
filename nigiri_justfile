@@ -1,0 +1,47 @@
+@default:
+  just --list
+
+
+@start:
+  echo "Starting Nigiri wallet demo for Spectrum project..."
+  nigiri start
+
+@stop:
+  nigiri stop
+
+@hardstop:
+  nigiri stop --delete
+
+@newwallet wallet_name:
+  nigiri rpc createwallet {{wallet_name}}
+  echo "Wallet {{wallet_name}}, has been created..."
+
+@genaddress:
+  nigiri rpc getnewaddress
+  echo "Generating new address:"
+
+@faucet address:
+  nigiri faucet {{address}}
+  echo "Sending bitcoin to {{address}}
+
+
+@chaininfo:
+  nigiri rpc getblockchaininfo
+
+@getbalance:
+  nigiri rpc getbalance
+  echo "Getting balance:"
+
+@listunspent:
+  nigiri rpc listunspent
+  echo "Listing unspent outputs:"
+
+@getblock blockhash:
+  nigiri rpc getblock {{blockhash}}
+  echo "Getting block {{blockhash}}:"
+
+@getblockstats height:
+  nigiri rpc getblock {{height}}
+  echo "Getting block stats for block {{height}}:"
+
+
