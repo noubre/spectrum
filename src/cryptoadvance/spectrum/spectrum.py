@@ -211,6 +211,21 @@ class Spectrum:
 
     # ToDo: subcribe_scripts and sync is very similiar. One does it for all of the scripts in the DB,
     # the other one only for a specific descriptor. We should merge them!
+    # def subcribe_scripts(self, descriptor, asyncc=True):
+    #     """Takes a descriptor and syncs all the scripts into the DB
+    #     creates a new thread doing that.
+    #     """
+    #     if asyncc:
+    #         t = FlaskThread(
+    #             target=self._subcribe_scripts,
+    #             args=[
+    #                 descriptor.id,
+    #             ],
+    #         )
+    #         t.start()
+    #     else:
+    #         self._subcribe_scripts(descriptor.id)
+
     def subcribe_scripts(self, descriptor, asyncc=True):
         """Takes a descriptor and syncs all the scripts into the DB
         creates a new thread doing that.
@@ -224,7 +239,134 @@ class Spectrum:
             )
             t.start()
         else:
-            self._subcribe_scripts(descriptor.id)
+            logger.debug(
+                f"Descriptor {descriptor.id} is not synced {descriptor.state} != {descriptor.synced_state}"
+            )
+            if descriptor.state != None:
+                logger.info(
+                    f"Descriptor {descriptor.id} has an update from state {descriptor.state} to {descriptor.synced_state}"
+                )
+            script_pubkey = descriptor.script_pubkey
+            internal = descriptor.internal
+            # get all transactions, utxos and update balances
+            # {height,tx_hash,tx_pos,value}
+            utxos = self.sock.call("blockchain.scripthash.listunspent", [descriptor.scripthash])
+            # {confirmed,unconfirmed}
+            balance = self.sock.call(
+                "blockchain.scripthash.get_balance", [descriptor.scripthash]
+            )
+            # {height,tx_hash}
+            txs = self.sock.call("blockchain.scripthash.get_history", [descriptor.scripthash])
+            # dict with all txs in the database
+            db_txs = {tx.txid: tx for tx in descriptor.txs}
+            # delete all txs that are not there any more:
+            all_txids = {tx["tx_hash"] for tx in txs}
+            for txid, tx in db_txs.items():
+                if txid not in all_txids:
+                    db.session.delete(tx)
+            for tx in txs:
+                blockheader = self.sock.call("blockchain.block.header", [tx.get("height")])
+                blockheader = parse_blockheader(blockheader)
+                # update existing - set height
+                tx_in_db = tx["tx_hash"] in db_txs
+                try:
+                    tx_magic = self.sock.call(
+                        "blockchain.transaction.get", [tx["tx_hash"], tx_in_db]
+                    )
+                except ValueError as e:
+                    if str(e).startswith(
+                            "verbose transactions are currently unsupported"
+                    ):  # electrs doesn't support it
+                        tx_magic = self.sock.call(
+                            "blockchain.transaction.get", [tx["tx_hash"], False]
+                        )
+                    else:
+                        raise e
+                if tx_in_db:
+                    db_txs[tx["tx_hash"]].height = tx.get("height")
+                    db_txs[tx["tx_hash"]].blockhash = blockheader.get(
+                        "blockhash"
+                    )  # not existing, how can we fix that?
+                    db_txs[tx["tx_hash"]].blocktime = blockheader.get(
+                        "blocktime"
+                    )  # not existing, how can we fix that?
+                # new tx
+                else:
+
+                    tx_details = {
+                        "tx_hash": tx_magic,
+                        "blockhash": blockheader.get("blockhash"),
+                        "blocktime": blockheader.get("blocktime"),
+                    }
+                    # dump to file
+                    fname = os.path.join(self.txdir, "%s.raw" % tx["tx_hash"])
+                    if not os.path.exists(fname):
+                        with open(fname, "w") as f:
+                            f.write(tx_magic)
+
+                    parsedTx = EmbitTransaction.from_string(tx_magic)
+                replaceable = all([inp.sequence < 0xFFFFFFFE for inp in parsedTx.vin])
+
+                category = TxCategory.RECEIVE
+                amount = 0
+                vout = 0
+                if script_pubkey not in [out.script_pubkey for out in parsedTx.vout]:
+                    category = TxCategory.SEND
+                    amount = -sum([out.value for out in parsedTx.vout])
+                else:
+                    vout = [out.script_pubkey for out in parsedTx.vout].index(
+                        script_pubkey
+                    )
+                    amount = parsedTx.vout[vout].value
+                    if internal:  # receive to change is hidden in txlist
+                        category = TxCategory.CHANGE
+
+                t = Tx(
+                    txid=tx["tx_hash"],
+                    blockhash=tx_details.get("blockhash"),
+                    height=tx.get("height"),
+                    blocktime=tx_details.get("blocktime"),
+                    replaceable=replaceable,
+                    category=category,
+                    vout=vout,
+                    amount=amount,
+                    fee=tx.get("fee", 0),
+                    # refs
+                    descriptor=descriptor,
+                    wallet=descriptor.wallet,
+                )
+                db.session.add(t)
+
+        # dicts of all electrum utxos and all db utxos
+        all_utxos = {(u["tx_hash"], u["tx_pos"]): u for u in utxos}
+        db_utxos = {(u.txid, u.vout): u for u in descriptor.utxos}
+        # delete all utxos that are not in electrum utxos
+        for k, utxo in db_utxos.items():
+            # delete if spent
+            if k not in all_utxos:
+                db.session.delete(utxo)
+        # add all utxos
+        for k, utxo in all_utxos.items():
+            # update existing
+            if k in db_utxos:
+                u = db_utxos[k]
+                u.height = utxo.get("height")
+                u.amount = utxo["value"]
+            # add new
+            else:
+                u = UTXO(
+                    txid=utxo["tx_hash"],
+                    vout=utxo["tx_pos"],
+                    height=utxo.get("height"),
+                    amount=utxo["value"],
+                    descriptor=descriptor,
+                    wallet=script.wallet,
+                )
+                db.session.add(u)
+        descriptor.state = state
+        descriptor.confirmed = balance["confirmed"]
+        descriptor.unconfirmed = balance["unconfirmed"]
+        db.session.commit()
 
     def _subcribe_scripts(self, descriptor_id: int) -> None:
         descriptor: Descriptor = Descriptor.query.filter(
@@ -268,138 +410,138 @@ class Spectrum:
             f"A total of {len(relevant_scripts)} scripts got subscribed where {count_syned_scripts} got synced"
         )
 
-    def sync_script(self, script, state=None):
-        # Normally every script has 1-2 transactions and 0-1 utxos,
-        # so even if we delete everything and resync it's ok
-        # except donation addresses that may have many txs...
-        logger.debug(
-            f"Script {script.scripthash[:7]} is not synced {script.state} != {state}"
-        )
-        if script.state != None:
-            logger.info(
-                f"Script {script.scripthash[:7]} has an update from state {script.state} to {state}"
-            )
-        script_pubkey = script.script_pubkey
-        internal = script.descriptor.internal
-        # get all transactions, utxos and update balances
-        # {height,tx_hash,tx_pos,value}
-        utxos = self.sock.call("blockchain.scripthash.listunspent", [script.scripthash])
-        # {confirmed,unconfirmed}
-        balance = self.sock.call(
-            "blockchain.scripthash.get_balance", [script.scripthash]
-        )
-        # {height,tx_hash}
-        txs = self.sock.call("blockchain.scripthash.get_history", [script.scripthash])
-        # dict with all txs in the database
-        db_txs = {tx.txid: tx for tx in script.txs}
-        # delete all txs that are not there any more:
-        all_txids = {tx["tx_hash"] for tx in txs}
-        for txid, tx in db_txs.items():
-            if txid not in all_txids:
-                db.session.delete(tx)
-        for tx in txs:
-            blockheader = self.sock.call("blockchain.block.header", [tx.get("height")])
-            blockheader = parse_blockheader(blockheader)
-            # update existing - set height
-            tx_in_db = tx["tx_hash"] in db_txs
-            try:
-                tx_magic = self.sock.call(
-                    "blockchain.transaction.get", [tx["tx_hash"], tx_in_db]
-                )
-            except ValueError as e:
-                if str(e).startswith(
-                    "verbose transactions are currently unsupported"
-                ):  # electrs doesn't support it
-                    tx_magic = self.sock.call(
-                        "blockchain.transaction.get", [tx["tx_hash"], False]
-                    )
-                else:
-                    raise e
-            if tx_in_db:
-                db_txs[tx["tx_hash"]].height = tx.get("height")
-                db_txs[tx["tx_hash"]].blockhash = blockheader.get(
-                    "blockhash"
-                )  # not existing, how can we fix that?
-                db_txs[tx["tx_hash"]].blocktime = blockheader.get(
-                    "blocktime"
-                )  # not existing, how can we fix that?
-            # new tx
-            else:
-
-                tx_details = {
-                    "tx_hash": tx_magic,
-                    "blockhash": blockheader.get("blockhash"),
-                    "blocktime": blockheader.get("blocktime"),
-                }
-                # dump to file
-                fname = os.path.join(self.txdir, "%s.raw" % tx["tx_hash"])
-                if not os.path.exists(fname):
-                    with open(fname, "w") as f:
-                        f.write(tx_magic)
-
-                parsedTx = EmbitTransaction.from_string(tx_magic)
-                replaceable = all([inp.sequence < 0xFFFFFFFE for inp in parsedTx.vin])
-
-                category = TxCategory.RECEIVE
-                amount = 0
-                vout = 0
-                if script_pubkey not in [out.script_pubkey for out in parsedTx.vout]:
-                    category = TxCategory.SEND
-                    amount = -sum([out.value for out in parsedTx.vout])
-                else:
-                    vout = [out.script_pubkey for out in parsedTx.vout].index(
-                        script_pubkey
-                    )
-                    amount = parsedTx.vout[vout].value
-                    if internal:  # receive to change is hidden in txlist
-                        category = TxCategory.CHANGE
-
-                t = Tx(
-                    txid=tx["tx_hash"],
-                    blockhash=tx_details.get("blockhash"),
-                    height=tx.get("height"),
-                    blocktime=tx_details.get("blocktime"),
-                    replaceable=replaceable,
-                    category=category,
-                    vout=vout,
-                    amount=amount,
-                    fee=tx.get("fee", 0),
-                    # refs
-                    script=script,
-                    wallet=script.wallet,
-                )
-                db.session.add(t)
-
-        # dicts of all electrum utxos and all db utxos
-        all_utxos = {(u["tx_hash"], u["tx_pos"]): u for u in utxos}
-        db_utxos = {(u.txid, u.vout): u for u in script.utxos}
-        # delete all utxos that are not in electrum utxos
-        for k, utxo in db_utxos.items():
-            # delete if spent
-            if k not in all_utxos:
-                db.session.delete(utxo)
-        # add all utxos
-        for k, utxo in all_utxos.items():
-            # update existing
-            if k in db_utxos:
-                u = db_utxos[k]
-                u.height = utxo.get("height")
-                u.amount = utxo["value"]
-            # add new
-            else:
-                u = UTXO(
-                    txid=utxo["tx_hash"],
-                    vout=utxo["tx_pos"],
-                    height=utxo.get("height"),
-                    amount=utxo["value"],
-                    script=script,
-                    wallet=script.wallet,
-                )
-                db.session.add(u)
-        script.state = state
-        script.confirmed = balance["confirmed"]
-        script.unconfirmed = balance["unconfirmed"]
-        db.session.commit()
+    # def sync_script(self, script, state=None):
+    #     # Normally every script has 1-2 transactions and 0-1 utxos,
+    #     # so even if we delete everything and resync it's ok
+    #     # except donation addresses that may have many txs...
+    #     logger.debug(
+    #         f"Script {script.scripthash[:7]} is not synced {script.state} != {state}"
+    #     )
+    #     if script.state != None:
+    #         logger.info(
+    #             f"Script {script.scripthash[:7]} has an update from state {script.state} to {state}"
+    #         )
+    #     script_pubkey = script.script_pubkey
+    #     internal = script.descriptor.internal
+    #     # get all transactions, utxos and update balances
+    #     # {height,tx_hash,tx_pos,value}
+    #     utxos = self.sock.call("blockchain.scripthash.listunspent", [script.scripthash])
+    #     # {confirmed,unconfirmed}
+    #     balance = self.sock.call(
+    #         "blockchain.scripthash.get_balance", [script.scripthash]
+    #     )
+    #     # {height,tx_hash}
+    #     txs = self.sock.call("blockchain.scripthash.get_history", [script.scripthash])
+    #     # dict with all txs in the database
+    #     db_txs = {tx.txid: tx for tx in script.txs}
+    #     # delete all txs that are not there any more:
+    #     all_txids = {tx["tx_hash"] for tx in txs}
+    #     for txid, tx in db_txs.items():
+    #         if txid not in all_txids:
+    #             db.session.delete(tx)
+    #     for tx in txs:
+    #         blockheader = self.sock.call("blockchain.block.header", [tx.get("height")])
+    #         blockheader = parse_blockheader(blockheader)
+    #         # update existing - set height
+    #         tx_in_db = tx["tx_hash"] in db_txs
+    #         try:
+    #             tx_magic = self.sock.call(
+    #                 "blockchain.transaction.get", [tx["tx_hash"], tx_in_db]
+    #             )
+    #         except ValueError as e:
+    #             if str(e).startswith(
+    #                 "verbose transactions are currently unsupported"
+    #             ):  # electrs doesn't support it
+    #                 tx_magic = self.sock.call(
+    #                     "blockchain.transaction.get", [tx["tx_hash"], False]
+    #                 )
+    #             else:
+    #                 raise e
+    #         if tx_in_db:
+    #             db_txs[tx["tx_hash"]].height = tx.get("height")
+    #             db_txs[tx["tx_hash"]].blockhash = blockheader.get(
+    #                 "blockhash"
+    #             )  # not existing, how can we fix that?
+    #             db_txs[tx["tx_hash"]].blocktime = blockheader.get(
+    #                 "blocktime"
+    #             )  # not existing, how can we fix that?
+    #         # new tx
+    #         else:
+    #
+    #             tx_details = {
+    #                 "tx_hash": tx_magic,
+    #                 "blockhash": blockheader.get("blockhash"),
+    #                 "blocktime": blockheader.get("blocktime"),
+    #             }
+    #             # dump to file
+    #             fname = os.path.join(self.txdir, "%s.raw" % tx["tx_hash"])
+    #             if not os.path.exists(fname):
+    #                 with open(fname, "w") as f:
+    #                     f.write(tx_magic)
+    #
+        #         parsedTx = EmbitTransaction.from_string(tx_magic)
+        #         replaceable = all([inp.sequence < 0xFFFFFFFE for inp in parsedTx.vin])
+        #
+        #         category = TxCategory.RECEIVE
+        #         amount = 0
+        #         vout = 0
+        #         if script_pubkey not in [out.script_pubkey for out in parsedTx.vout]:
+        #             category = TxCategory.SEND
+        #             amount = -sum([out.value for out in parsedTx.vout])
+        #         else:
+        #             vout = [out.script_pubkey for out in parsedTx.vout].index(
+        #                 script_pubkey
+        #             )
+        #             amount = parsedTx.vout[vout].value
+        #             if internal:  # receive to change is hidden in txlist
+        #                 category = TxCategory.CHANGE
+        #
+        #         t = Tx(
+        #             txid=tx["tx_hash"],
+        #             blockhash=tx_details.get("blockhash"),
+        #             height=tx.get("height"),
+        #             blocktime=tx_details.get("blocktime"),
+        #             replaceable=replaceable,
+        #             category=category,
+        #             vout=vout,
+        #             amount=amount,
+        #             fee=tx.get("fee", 0),
+        #             # refs
+        #             script=script,
+        #             wallet=script.wallet,
+        #         )
+        #         db.session.add(t)
+        #
+        # # dicts of all electrum utxos and all db utxos
+        # all_utxos = {(u["tx_hash"], u["tx_pos"]): u for u in utxos}
+        # db_utxos = {(u.txid, u.vout): u for u in script.utxos}
+        # # delete all utxos that are not in electrum utxos
+        # for k, utxo in db_utxos.items():
+        #     # delete if spent
+        #     if k not in all_utxos:
+        #         db.session.delete(utxo)
+        # # add all utxos
+        # for k, utxo in all_utxos.items():
+        #     # update existing
+        #     if k in db_utxos:
+        #         u = db_utxos[k]
+        #         u.height = utxo.get("height")
+        #         u.amount = utxo["value"]
+        #     # add new
+        #     else:
+        #         u = UTXO(
+        #             txid=utxo["tx_hash"],
+        #             vout=utxo["tx_pos"],
+        #             height=utxo.get("height"),
+        #             amount=utxo["value"],
+        #             script=script,
+        #             wallet=script.wallet,
+        #         )
+        #         db.session.add(u)
+        # script.state = state
+        # script.confirmed = balance["confirmed"]
+        # script.unconfirmed = balance["unconfirmed"]
+        # db.session.commit()
 
     @property
     def network(self):
